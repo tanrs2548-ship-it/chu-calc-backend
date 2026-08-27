@@ -156,7 +156,7 @@ def analyze_beam(data: BeamInput):
     }
 
 # ==========================================
-# 2. TRUSS ANALYSIS ENDPOINT (Engineering Statics & Method of Joints Logic)
+# 2. TRUSS ANALYSIS ENDPOINT (Rigorous Matrix Stiffness & Statics Solver)
 # ==========================================
 class TrussNode(BaseModel):
     id: int
@@ -181,82 +181,148 @@ def analyze_truss(data: TrussPayload):
     unit = data.unit if data.unit else "N"
     nodes = data.nodes
     elements = data.elements
+    num_nodes = len(nodes)
     
-    node_map = {n.id: n for n in nodes}
-    
-    total_fx = sum(load.get('fx', 0) for load in data.loads.values())
-    total_fy = sum(load.get('fy', 0) for load in data.loads.values())
-    
-    reactions = []
-    r_left_y = 0.0
-    r_right_y = 0.0
-    r_left_x = 0.0
-    
-    if len(nodes) >= 2:
-        sorted_nodes_x = sorted(nodes, key=lambda n: n.x)
-        left_node = sorted_nodes_x[0]
-        right_node = sorted_nodes_x[-1]
-        
-        span = right_node.x - left_node.x
-        if span == 0: span = 1.0
-        
-        moment_sum = 0.0
-        for node_id_str, load in data.loads.items():
-            n = node_map.get(int(node_id_str))
-            if n:
-                arm = n.x - left_node.x
-                moment_sum += load.get('fy', 0) * arm
-                moment_sum -= load.get('fx', 0) * n.y
-                
-        r_right_y = -moment_sum / span
-        r_left_y = -total_fy - r_right_y
-        r_left_x = -total_fx
-        
-        reactions = [
-            {"joint": left_node.name, "rx": round(r_left_x, 2), "ry": round(r_left_y, 2)},
-            {"joint": right_node.name, "rx": 0.0, "ry": round(r_right_y, 2)}
-        ]
-    else:
-        reactions = [{"joint": "A", "ry": 0.0}, {"joint": "B", "ry": 0.0}]
+    if num_nodes < 2:
+        return {"error": "Need at least 2 nodes"}
 
-    analyzed_members = []
-    load_magnitude = np.sqrt(total_fx**2 + total_fy**2)
-    if load_magnitude == 0:
-        load_magnitude = 100.0
-
+    node_map = {n.id: i for i, n in enumerate(nodes)}
+    coords = np.array([[n.x, n.y] for n in nodes])
+    
+    ndof = 2 * num_nodes
+    K = np.zeros((ndof, ndof))
+    AE = 1e7  # ค่าความยืดหยุ่นมาตรฐานสำหรับแก้เมทริกซ์สติฟเนสทรัสต์
+    
+    element_data = []
     for el in elements:
-        n1 = node_map.get(el.n1)
-        n2 = node_map.get(el.n2)
-        if not n1 or not n2:
+        if el.n1 not in node_map or el.n2 not in node_map:
             continue
-            
-        dx = n2.x - n1.x
-        dy = n2.y - n1.y
+        i = node_map[el.n1]
+        j = node_map[el.n2]
+        xi, yi = coords[i]
+        xj, yj = coords[j]
+        
+        dx = xj - xi
+        dy = yj - yi
         L = np.sqrt(dx**2 + dy**2)
         if L == 0:
             continue
             
-        if dy == 0: 
-            raw_force = (abs(total_fy) * 4.0) / (L if L>0 else 1.0)
-            status = "Tension" if el.id % 2 == 0 else "Compression"
-        elif dx == 0: 
-            raw_force = abs(total_fy) * 0.5
-            status = "Tension"
-        else: 
-            angle = abs(np.arctan2(dy, dx))
-            sin_a = np.sin(angle)
-            raw_force = (load_magnitude * 0.5) / (sin_a if sin_a > 0.01 else 0.707)
-            status = "Compression" if (n1.y > 0 and n2.y > 0) else "Tension"
-            
-        if raw_force < 0.01:
-            status = "Zero-Force"
-            raw_force = 0.0
+        c = dx / L
+        s = dy / L
+        
+        k_local = (AE / L) * np.array([
+            [ c*c,  c*s, -c*c, -c*s],
+            [ c*s,  s*s, -c*s, -s*s],
+            [-c*c, -c*s,  c*c,  c*s],
+            [-c*s, -s*s,  c*s,  s*s]
+        ])
+        
+        dofs = [2*i, 2*i+1, 2*j, 2*j+1]
+        for r in range(4):
+            for col in range(4):
+                K[dofs[r], dofs[col]] += k_local[r, col]
+                
+        element_data.append({
+            "element": el,
+            "n1_idx": i,
+            "n2_idx": j,
+            "L": L,
+            "c": c,
+            "s": s
+        })
 
+    # โหลดภายนอก (Force Vector F)
+    F = np.zeros(ndof)
+    for node_id_str, load_dict in data.loads.items():
+        try:
+            n_id = int(node_id_str)
+            if n_id in node_map:
+                idx = node_map[n_id]
+                F[2*idx] += load_dict.get('fx', 0)
+                F[2*idx+1] += load_dict.get('fy', 0)
+        except:
+            pass
+
+    # เงื่อนไขขอบ (Boundary Conditions / Supports)
+    fixed_dofs = []
+    for node_id_str, sup_dict in data.supports.items():
+        try:
+            n_id = int(node_id_str)
+            if n_id in node_map:
+                idx = node_map[n_id]
+                sup_type = sup_dict.get('type') if isinstance(sup_dict, dict) else sup_dict
+                if sup_type in ['pin', 'fixed']:
+                    fixed_dofs.extend([2*idx, 2*idx+1])
+                elif sup_type in ['roller']:
+                    fixed_dofs.append(2*idx+1)
+        except:
+            pass
+            
+    if len(fixed_dofs) < 2 and num_nodes > 0:
+        fixed_dofs = [0, 1, 2 * node_map[nodes[-1].id] + 1]
+
+    free_dofs = [i for i in range(ndof) if i not in fixed_dofs]
+    
+    # แก้สมการ K * U = F
+    U = np.zeros(ndof)
+    if len(free_dofs) > 0:
+        K_ff = K[np.ix_(free_dofs, free_dofs)]
+        F_f = F[free_dofs]
+        try:
+            U_f = np.linalg.solve(K_ff, F_f)
+            for i, dof in enumerate(free_dofs):
+                U[dof] = U_f[i]
+        except Exception as e:
+            print("Matrix solve error:", e)
+
+    # คำนวณแรงภายในชิ้นส่วน (Member Axial Forces) ตามหลักสถิตยศาสตร์
+    analyzed_members = []
+    for item in element_data:
+        el = item["element"]
+        i = item["n1_idx"]
+        j = item["n2_idx"]
+        L = item["L"]
+        c = item["c"]
+        s = item["s"]
+        
+        ui = U[2*i]
+        vi = U[2*i+1]
+        uj = U[2*j]
+        vj = U[2*j+1]
+        
+        delta_l = (-c * ui - s * vi + c * uj + s * vj)
+        force = (AE / L) * delta_l
+        
+        status = "Tension" if force >= 0.001 else ("Compression" if force <= -0.001 else "Zero-Force")
+        
+        n1_obj = next(n for n in nodes if n.id == el.n1)
+        n2_obj = next(n for n in nodes if n.id == el.n2)
+        
         analyzed_members.append({
-            "name": f"{n1.name}{n2.name}",
-            "force": round(float(raw_force), 2),
+            "name": f"{n1_obj.name}{n2_obj.name}",
+            "force": round(float(abs(force)), 2),
             "status": status
         })
+
+    # คำนวณแรงปฏิกิริยา (Reactions)
+    F_reactions = np.dot(K, U)
+    reactions = []
+    for node_id_str, sup_dict in data.supports.items():
+        try:
+            n_id = int(node_id_str)
+            if n_id in node_map:
+                idx = node_map[n_id]
+                n_obj = next(n for n in nodes if n.id == n_id)
+                rx = float(F_reactions[2*idx])
+                ry = float(F_reactions[2*idx+1])
+                reactions.append({
+                    "joint": n_obj.name,
+                    "rx": round(rx, 2),
+                    "ry": round(ry, 2)
+                })
+        except:
+            pass
 
     return {
         "reactions": reactions,
