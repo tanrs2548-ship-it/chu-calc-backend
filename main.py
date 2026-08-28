@@ -32,13 +32,11 @@ class BeamInput(BaseModel):
     loads: List[LoadItem]
     unit: Optional[str] = "kN"
     ei: Optional[float] = 10000.0
+    analysis_type: Optional[str] = "determinate"  # เพิ่มตัวแปรรับค่าโหมดวิเคราะห์
 
 def mac_step(x, a, n):
     return np.where(x > a, (x - a)**n, 0)
 
-# ==========================================
-# 1. BEAM ANALYSIS ENDPOINT (Supports Continuous & Isotropic/Indeterminate Beams)
-# ==========================================
 @app.post("/api/analyze")
 def analyze_beam(data: BeamInput):
     unit = data.unit if data.unit else "kN"
@@ -50,10 +48,8 @@ def analyze_beam(data: BeamInput):
 
     beam_len = data.beam_length
     
-    # เช็คประเภทโครงสร้างตามหลักสถิตยศาสตร์ที่แท้จริง
-    # หากมีซัพพอร์ตมากกว่า 2 จุด หรือมี Fixed support ถึงจะเป็น Statically Indeterminate
-    has_fixed = any(s.type == 'fixed' for s in supports)
-    is_indeterminate = len(supports) > 2 or has_fixed
+    # ใช้ค่าที่ผู้ใช้เลือกจาก Dropdown ในหน้าเว็บโดยตรง
+    is_indeterminate = (data.analysis_type == "indeterminate")
 
     x_smooth = np.linspace(0, beam_len, 500)
     shear_smooth = np.zeros_like(x_smooth)
@@ -65,7 +61,6 @@ def analyze_beam(data: BeamInput):
     steps.append("1. STRUCTURE CLASSIFICATION & EQUILIBRIUM")
 
     if not is_indeterminate:
-        # กรณีคานช่วงเดี่ยวทั่วไป (Determinate Beam)
         sup1, sup2 = supports[0], supports[1]
         L_sup = sup2.x - sup1.x 
         
@@ -115,9 +110,6 @@ def analyze_beam(data: BeamInput):
                 moment_smooth += (w / 2) * mac_step(x_smooth, b, 2)
 
     else:
-        # ==========================================
-        # MOMENT DISTRIBUTION METHOD (Hardy Cross Solver) สำหรับคานต่อเนื่อง
-        # ==========================================
         steps.append(f"System: Statically Indeterminate Continuous Beam ({len(supports)} supports)")
         steps.append("Method: Moment Distribution (Hardy Cross Algorithm)")
         
@@ -251,7 +243,6 @@ def analyze_beam(data: BeamInput):
             mom_sub = ml + (mr - ml) * (x_sub / L) if L > 0 else np.zeros_like(x_sub)
             moment_smooth[mask] = mom_sub
 
-    # คำนวณค่าสูงสุดและพิกัดตำแหน่งจริง
     max_shear = float(np.max(np.abs(shear_smooth)))
     max_moment_idx = int(np.argmax(np.abs(moment_smooth)))
     max_moment = float(np.abs(moment_smooth)[max_moment_idx])
