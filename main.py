@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 import numpy as np
 
 app = FastAPI(title="Chucalc Backend")
@@ -14,6 +14,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==========================================
+# BEAM MODELS
+# ==========================================
 class SupportItem(BaseModel):
     id: int
     type: str  # 'pin', 'roller', 'fixed', 'free'
@@ -32,7 +35,7 @@ class BeamInput(BaseModel):
     loads: List[LoadItem]
     unit: Optional[str] = "kN"
     ei: Optional[float] = 10000.0
-    analysis_type: Optional[str] = "determinate"  # เพิ่มตัวแปรรับค่าโหมดวิเคราะห์
+    analysis_type: Optional[str] = "determinate"
 
 def mac_step(x, a, n):
     return np.where(x > a, (x - a)**n, 0)
@@ -47,8 +50,6 @@ def analyze_beam(data: BeamInput):
         return {"error": "Need at least 2 supports"}
 
     beam_len = data.beam_length
-    
-    # ใช้ค่าที่ผู้ใช้เลือกจาก Dropdown ในหน้าเว็บโดยตรง
     is_indeterminate = (data.analysis_type == "indeterminate")
 
     x_smooth = np.linspace(0, beam_len, 500)
@@ -277,3 +278,137 @@ def analyze_beam(data: BeamInput):
             "moment": moment_smooth.tolist()
         }
     }
+
+# ==========================================
+# TRUSS MODELS & ENDPOINT
+# ==========================================
+class TrussNode(BaseModel):
+    id: int
+    name: str
+    x: float
+    y: float
+
+class TrussElement(BaseModel):
+    id: int
+    n1: int
+    n2: int
+
+class TrussSupport(BaseModel):
+    type: str
+    direction: Optional[str] = "horizontal"
+
+class TrussLoad(BaseModel):
+    fx: Optional[float] = 0.0
+    fy: Optional[float] = 0.0
+
+class TrussInput(BaseModel):
+    nodes: List[TrussNode]
+    elements: List[TrussElement]
+    supports: Dict[str, TrussSupport]
+    loads: Dict[str, TrussLoad]
+    unit: Optional[str] = "kN"
+    ei: Optional[float] = None
+
+@app.post("/api/analyze-truss")
+def analyze_truss(data: TrussInput):
+    node_idx = {n.id: i for i, n in enumerate(data.nodes)}
+    n_nodes = len(data.nodes)
+    
+    K = np.zeros((2 * n_nodes, 2 * n_nodes))
+    F = np.zeros(2 * n_nodes)
+    
+    # พลิกทิศทางแรงโหลดให้ตรงกับแกนคณิตศาสตร์
+    for n_id_str, load in data.loads.items():
+        n_id = int(n_id_str)
+        if n_id in node_idx:
+            idx = node_idx[n_id]
+            if load.fx: F[2 * idx] = load.fx
+            if load.fy: F[2 * idx + 1] = -load.fy
+            
+    # พลิกแกน Y ของ Canvas ให้พุ่งขึ้นตามสมการ
+    nodes_math = {n.id: (n.x, -n.y) for n in data.nodes}
+    lengths = {}
+    
+    for el in data.elements:
+        x1, y1 = nodes_math[el.n1]
+        x2, y2 = nodes_math[el.n2]
+        L = np.hypot(x2 - x1, y2 - y1)
+        lengths[el.id] = L
+        if L == 0: continue
+        
+        c = (x2 - x1) / L
+        s = (y2 - y1) / L
+        
+        EA = data.ei if data.ei else (200 * 5000)
+        k = EA / L
+        
+        k_mat = k * np.array([
+            [ c*c,  c*s, -c*c, -c*s],
+            [ c*s,  s*s, -c*s, -s*s],
+            [-c*c, -c*s,  c*c,  c*s],
+            [-c*s, -s*s,  c*s,  s*s]
+        ])
+        
+        idx1 = node_idx[el.n1]
+        idx2 = node_idx[el.n2]
+        dofs = [2*idx1, 2*idx1+1, 2*idx2, 2*idx2+1]
+        
+        for i in range(4):
+            for j in range(4):
+                K[dofs[i], dofs[j]] += k_mat[i, j]
+                
+    fixed_dofs = []
+    for n_id_str, sup in data.supports.items():
+        n_id = int(n_id_str)
+        if n_id in node_idx:
+            idx = node_idx[n_id]
+            if sup.type == 'pin' or sup.type == 'fixed':
+                fixed_dofs.extend([2*idx, 2*idx+1])
+            elif sup.type == 'roller':
+                fixed_dofs.append(2*idx+1)
+                
+    # ป้องกัน Matrix Singularity สำหรับโหนดที่ไม่ได้เชื่อมต่อ
+    K += np.eye(2 * n_nodes) * 1e-9
+    
+    for dof in fixed_dofs:
+        K[dof, :] = 0
+        K[:, dof] = 0
+        K[dof, dof] = 1.0
+        F[dof] = 0.0
+        
+    try:
+        U = np.linalg.solve(K, F)
+    except np.linalg.LinAlgError:
+        U = np.zeros(2 * n_nodes)
+        
+    members_res = []
+    for el in data.elements:
+        idx1 = node_idx[el.n1]
+        idx2 = node_idx[el.n2]
+        
+        x1, y1 = nodes_math[el.n1]
+        x2, y2 = nodes_math[el.n2]
+        L = lengths[el.id]
+        
+        if L == 0:
+            members_res.append({"name": f"{data.nodes[idx1].name}{data.nodes[idx2].name}", "force": 0.0, "status": "Zero-Force"})
+            continue
+            
+        c = (x2 - x1) / L
+        s = (y2 - y1) / L
+        u = np.array([ U[2*idx1], U[2*idx1+1], U[2*idx2], U[2*idx2+1] ])
+        
+        EA = data.ei if data.ei else (200 * 5000)
+        k = EA / L
+        T = np.array([-c, -s, c, s])
+        
+        force = k * np.dot(T, u)
+        status = "Tension" if force > 0.01 else ("Compression" if force < -0.01 else "Zero-Force")
+        
+        members_res.append({
+            "name": f"{data.nodes[idx1].name}{data.nodes[idx2].name}",
+            "force": round(float(abs(force)), 2),
+            "status": status
+        })
+        
+    return {"members": members_res}
