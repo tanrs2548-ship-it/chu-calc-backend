@@ -50,9 +50,10 @@ def analyze_beam(data: BeamInput):
 
     beam_len = data.beam_length
     
-    # แยกประเภทซัพพอร์ต: ตรวจสอบว่าเป็น Statically Determinate หรือ Indeterminate
-    # หากมีซัพพอร์ตมากกว่า 2 จุด หรือมี Fixed support เข้ามา จะใช้ Moment Distribution Method
-    is_indeterminate = len(supports) > 2 or any(s.type == 'fixed' for s in supports)
+    # เช็คประเภทโครงสร้างตามหลักสถิตยศาสตร์ที่แท้จริง
+    # หากมีซัพพอร์ตมากกว่า 2 จุด หรือมี Fixed support ถึงจะเป็น Statically Indeterminate
+    has_fixed = any(s.type == 'fixed' for s in supports)
+    is_indeterminate = len(supports) > 2 or has_fixed
 
     x_smooth = np.linspace(0, beam_len, 500)
     shear_smooth = np.zeros_like(x_smooth)
@@ -128,8 +129,7 @@ def analyze_beam(data: BeamInput):
             L_span = x_right - x_left
             spans.append({"span_id": i, "L": L_span, "x_left": x_left, "x_right": x_right})
 
-        # 1. คำนวณ Fixed-End Moments (FEM) สำหรับแต่ละช่วงจากโหลดรอบด้าน
-        fem = {} # เก็บค่า FEM ของแต่ละช่วง (Left-to-Right และ Right-to-Left)
+        fem = {}
         for i, span in enumerate(spans):
             L = span["L"]
             xl = span["x_left"]
@@ -144,88 +144,60 @@ def analyze_beam(data: BeamInput):
                         a = l.x - xl
                         b = xr - l.x
                         P = l.magnitude
-                        # FEM สำหรับ Fixed-Fixed Beam: -Pab^2/L^2 (ซ้าย), +Pa^2b/L^2 (ขวา)
                         fem[(i, "left")] -= (P * a * (b**2)) / (L**2) if L > 0 else 0
                         fem[(i, "right")] += (P * (a**2) * b) / (L**2) if L > 0 else 0
                 elif l.type == 'distributed':
                     sa = l.start_x if l.start_x is not None else xl
                     sb = l.end_x if l.end_x is not None else xr
                     w = l.magnitude
-                    # ตัดช่วงเฉพาะที่ทับกับ span นี้
                     overlap_start = max(xl, sa)
                     overlap_end = min(xr, sb)
                     if overlap_start < overlap_end:
                         sub_len = overlap_end - overlap_start
-                        # คำนวณ FEM คร่าวๆ จาก UDL เต็มช่วงย่อย
                         fem[(i, "left")] -= (w * (sub_len**2)) / 12
                         fem[(i, "right")] += (w * (sub_len**2)) / 12
 
-        # 2. คำนวณ Stiffness (K) และ Distribution Factors (DF) ที่แต่ละโหนดภายใน
         nodes = supports
-        node_moments = {n.id: 0.0 for n in nodes}
-        
-        # จำลองการแจกแจงโมเมนต์ (Moment Distribution Iterations - 15 รอบเพื่อให้เข้าใกล้ 0)
-        # เก็บค่าโมเมนต์สะสมที่จุดรองรับ
         joint_moments = {n.id: 0.0 for n in nodes}
-        # กำหนดให้ Fixed support ตรึงโมเมนต์ได้ ปลาย Pinned/Roller โมเมนต์เป็น 0
         for n in nodes:
             if n.type == 'fixed':
-                joint_moments[n.id] = 0.0 # เดี๋ยวคำนวณจริงจากกระจาย
+                joint_moments[n.id] = 0.0
 
         steps.append("Executing Moment Distribution iterations until unbalanced moment -> 0...")
         
-        # ทำการกระจายซ้ำ (Iterative Distribution & Carry-over)
-        # เริ่มต้นเซ็ตโมเมนต์รอบแรกด้วย FEM
         running_fem_left = {i: fem[(i, "left")] for i in range(num_spans)}
         running_fem_right = {i: fem[(i, "right")] for i in range(num_spans)}
 
-        for iteration in range(20): # 20 iterations
+        for iteration in range(20):
             unbalanced_at_joint = {}
-            # คำนวณ Unbalanced moment ที่แต่ละโหนดภายใน (โหนดที่ i ระหว่าง span i-1 และ span i)
             for j in range(1, len(nodes) - 1):
-                n_id = nodes[j].id
                 if nodes[j].type == 'free': continue
-                
-                # โมเมนต์ที่เข้ามาที่โหนดนี้จาก span ซ้าย (right end ของ span j-1) และ span ขวา (left end ของ span j)
                 m_left_span = running_fem_right.get(j-1, 0.0)
                 m_right_span = running_fem_left.get(j, 0.0)
-                
                 unbalanced = -(m_left_span + m_right_span)
                 unbalanced_at_joint[j] = unbalanced
 
-            # แจกแจงตามสัดส่วน Stiffness K = 4EI/L
-            distributed_delta_right = {}
-            distributed_delta_left = {}
             for j in range(1, len(nodes) - 1):
                 if j not in unbalanced_at_joint: continue
                 unbal = unbalanced_at_joint[j]
-                
                 k_left = 4.0 / spans[j-1]["L"] if spans[j-1]["L"] > 0 else 1.0
                 k_right = 4.0 / spans[j]["L"] if spans[j]["L"] > 0 else 1.0
                 sum_k = k_left + k_right
-                
                 df_left = k_left / sum_k if sum_k > 0 else 0.5
                 df_right = k_right / sum_k if sum_k > 0 else 0.5
                 
-                dist_l = unbal * df_left
-                dist_r = unbal * df_right
-                
-                running_fem_right[j-1] += dist_l
-                running_fem_left[j] += dist_r
+                running_fem_right[j-1] += unbal * df_left
+                running_fem_left[j] += unbal * df_right
 
-            # Carry-over (ส่งผ่านค่า 50% ไปยังปลายอีกด้านของแต่ละช่วง)
             new_fem_l = {}
             new_fem_r = {}
             for i in range(num_spans):
-                co_l = 0.5 * running_fem_right.get(i, 0.0)
-                co_r = 0.5 * running_fem_left.get(i, 0.0)
-                new_fem_l[i] = co_r
-                new_fem_r[i] = co_l
+                new_fem_l[i] = 0.5 * running_fem_left.get(i, 0.0)
+                new_fem_r[i] = 0.5 * running_fem_right.get(i, 0.0)
             
             running_fem_left = new_fem_l
             running_fem_right = new_fem_r
 
-        # บันทึกโมเมนต์ปลายซัพพอร์ตทั้งหมดหลังแจกแจงเสร็จ
         for j, n in enumerate(nodes):
             if j == 0:
                 joint_moments[n.id] = running_fem_left.get(0, 0.0)
@@ -236,17 +208,13 @@ def analyze_beam(data: BeamInput):
 
         steps.append("Moment Distribution completed successfully. Support moments balanced to ~0.")
 
-        # คำนวณ Reaction จากโมเมนต์ซัพพอร์ตและโหลดแต่ละช่วง
         for i, span in enumerate(spans):
             xl = span["x_left"]
             xr = span["x_right"]
             L = span["L"]
-            
-            # โมเมนต์ซ้ายและขวาของช่วงนี้
             m_l = joint_moments[nodes[i].id]
             m_r = joint_moments[nodes[i+1].id]
             
-            # คิด Reaction แยกตามช่วงคานช่วงเดี่ยว (Simply Supported Reaction) + ผลจากโมเมนต์ปลาย
             span_load_sum = 0.0
             span_moment_sum = 0.0
             for l in data.loads:
@@ -264,7 +232,6 @@ def analyze_beam(data: BeamInput):
                         span_load_sum += weq
                         span_moment_sum += weq * (cg - xl)
 
-            # R_right สำหรับช่วงนี้ = (span_moment_sum + m_l - m_r) / L
             r_r = (span_moment_sum + m_l - m_r) / L if L > 0 else 0.0
             r_l = span_load_sum - r_r
             
@@ -272,26 +239,23 @@ def analyze_beam(data: BeamInput):
             if i == num_spans - 1:
                 reactions.append({"support_x": xr, "span_idx": i+1, "force_kN": r_r})
 
-        # สร้างกราฟ Moment และ Shear จาก superposition ของแต่ละช่วงคานต่อเนื่อง
         for i, span in enumerate(spans):
             xl = span["x_left"]
             xr = span["x_right"]
             mask = (x_smooth >= xl) & (x_smooth <= xr)
             x_sub = x_smooth[mask] - xl
-            
-            # คิดผลตอบสนองในแต่ละช่วง
             ml = joint_moments[nodes[i].id]
             mr = joint_moments[nodes[i+1].id]
             L = span["L"]
             
-            # Linear moment interpolation จากปลายซ้ายไปขวา + โหลด
             mom_sub = ml + (mr - ml) * (x_sub / L) if L > 0 else np.zeros_like(x_sub)
             moment_smooth[mask] = mom_sub
 
-    # คำนวณค่าสูงสุด
+    # คำนวณค่าสูงสุดและพิกัดตำแหน่งจริง
     max_shear = float(np.max(np.abs(shear_smooth)))
-    max_moment = float(np.max(np.abs(moment_smooth)))
-    zero_shear_x = float(beam_len / 2.0)
+    max_moment_idx = int(np.argmax(np.abs(moment_smooth)))
+    max_moment = float(np.abs(moment_smooth)[max_moment_idx])
+    zero_shear_x = float(x_smooth[max_moment_idx])
 
     interval_x = np.arange(0, beam_len + 0.1, 2.0)
     tabular_data = []
@@ -322,5 +286,3 @@ def analyze_beam(data: BeamInput):
             "moment": moment_smooth.tolist()
         }
     }
-
-# โค้ดส่วน Truss และ Frame Endpoint คงเดิม...
