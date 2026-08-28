@@ -23,11 +23,12 @@ class SupportItem(BaseModel):
     x: float
 
 class LoadItem(BaseModel):
-    type: str  # 'point', 'distributed'
+    type: str  # 'point', 'distributed', 'moment'
     magnitude: float
     x: Optional[float] = None
     start_x: Optional[float] = None
     end_x: Optional[float] = None
+    direction: Optional[str] = "cw" # 'cw' หรือ 'ccw'
 
 class BeamInput(BaseModel):
     beam_length: float
@@ -83,6 +84,9 @@ def analyze_beam(data: BeamInput):
                 dist = cg - sup1.x
                 moment_sum_val += W_eq * dist
                 total_load += W_eq
+            elif l.type == 'moment':
+                m_val = l.magnitude if l.direction == 'cw' else -l.magnitude
+                moment_sum_val += m_val
                 
         R2 = moment_sum_val / L_sup if L_sup > 0 else 0.0
         R1 = total_load - R2
@@ -109,6 +113,9 @@ def analyze_beam(data: BeamInput):
                 shear_smooth += w * mac_step(x_smooth, b, 1)
                 moment_smooth -= (w / 2) * mac_step(x_smooth, a, 2)
                 moment_smooth += (w / 2) * mac_step(x_smooth, b, 2)
+            elif l.type == 'moment':
+                m_val = l.magnitude if l.direction == 'cw' else -l.magnitude
+                moment_smooth += m_val * mac_step(x_smooth, l.x, 0)
 
     else:
         steps.append(f"System: Statically Indeterminate Continuous Beam ({len(supports)} supports)")
@@ -149,6 +156,13 @@ def analyze_beam(data: BeamInput):
                         sub_len = overlap_end - overlap_start
                         fem[(i, "left")] -= (w * (sub_len**2)) / 12
                         fem[(i, "right")] += (w * (sub_len**2)) / 12
+                elif l.type == 'moment' and l.x is not None:
+                    if xl <= l.x <= xr:
+                        a = l.x - xl
+                        b = xr - l.x
+                        m_val = l.magnitude if l.direction == 'cw' else -l.magnitude
+                        fem[(i, "left")] += (m_val * b * (2*a - b)) / (L**2) if L > 0 else 0
+                        fem[(i, "right")] += (m_val * a * (2*b - a)) / (L**2) if L > 0 else 0
 
         nodes = supports
         joint_moments = {n.id: 0.0 for n in nodes}
@@ -199,7 +213,7 @@ def analyze_beam(data: BeamInput):
             else:
                 joint_moments[n.id] = running_fem_right.get(j-1, 0.0)
 
-        steps.append("Moment Distribution completed successfully. Support moments balanced to ~0.")
+        steps.append("Moment Distribution completed successfully.")
 
         for i, span in enumerate(spans):
             xl = span["x_left"]
@@ -224,6 +238,9 @@ def analyze_beam(data: BeamInput):
                         cg = sa + slen / 2.0
                         span_load_sum += weq
                         span_moment_sum += weq * (cg - xl)
+                elif l.type == 'moment' and l.x is not None and xl <= l.x <= xr:
+                    m_val = l.magnitude if l.direction == 'cw' else -l.magnitude
+                    span_moment_sum += m_val
 
             r_r = (span_moment_sum + m_l - m_r) / L if L > 0 else 0.0
             r_l = span_load_sum - r_r
@@ -242,6 +259,13 @@ def analyze_beam(data: BeamInput):
             L = span["L"]
             
             mom_sub = ml + (mr - ml) * (x_sub / L) if L > 0 else np.zeros_like(x_sub)
+            
+            for l in data.loads:
+                if l.type == 'moment' and l.x is not None and xl <= l.x <= xr:
+                    a = l.x - xl
+                    m_val = l.magnitude if l.direction == 'cw' else -l.magnitude
+                    mom_sub += -m_val * x_sub / L + m_val * mac_step(x_sub, a, 0)
+                    
             moment_smooth[mask] = mom_sub
 
     max_shear = float(np.max(np.abs(shear_smooth)))
@@ -256,7 +280,6 @@ def analyze_beam(data: BeamInput):
         v_val = float(shear_smooth[idx])
         m_val = float(moment_smooth[idx])
         tabular_data.append({"x": float(x_val), "shear": v_val, "moment": m_val})
-        steps.append(f"At x = {x_val:4.1f} m | Shear V = {v_val:.2f} {unit}, Moment M = {m_val:.2f} {moment_unit}")
 
     steps.append("==================================================")
     steps.append("3. MAXIMUM DESIGN VALUES")
@@ -317,7 +340,6 @@ def analyze_truss(data: TrussInput):
     K = np.zeros((2 * n_nodes, 2 * n_nodes))
     F = np.zeros(2 * n_nodes)
     
-    # พลิกทิศทางแรงโหลดให้ตรงกับแกนคณิตศาสตร์
     for n_id_str, load in data.loads.items():
         n_id = int(n_id_str)
         if n_id in node_idx:
@@ -325,7 +347,6 @@ def analyze_truss(data: TrussInput):
             if load.fx: F[2 * idx] = load.fx
             if load.fy: F[2 * idx + 1] = -load.fy
             
-    # พลิกแกน Y ของ Canvas ให้พุ่งขึ้นตามสมการ
     nodes_math = {n.id: (n.x, -n.y) for n in data.nodes}
     lengths = {}
     
@@ -367,7 +388,6 @@ def analyze_truss(data: TrussInput):
             elif sup.type == 'roller':
                 fixed_dofs.append(2*idx+1)
                 
-    # ป้องกัน Matrix Singularity สำหรับโหนดที่ไม่ได้เชื่อมต่อ
     K += np.eye(2 * n_nodes) * 1e-9
     
     for dof in fixed_dofs:
