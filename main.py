@@ -19,16 +19,16 @@ app.add_middleware(
 # ==========================================
 class SupportItem(BaseModel):
     id: int
-    type: str  # 'pin', 'roller', 'fixed', 'free'
+    type: str
     x: float
 
 class LoadItem(BaseModel):
-    type: str  # 'point', 'distributed', 'moment'
+    type: str
     magnitude: float
     x: Optional[float] = None
     start_x: Optional[float] = None
     end_x: Optional[float] = None
-    direction: Optional[str] = "cw" # 'cw' หรือ 'ccw'
+    direction: Optional[str] = "cw"
 
 class BeamInput(BaseModel):
     beam_length: float
@@ -59,16 +59,11 @@ def analyze_beam(data: BeamInput):
     reactions = []
     steps = []
     
-    steps.append("==================================================")
-    steps.append("1. STRUCTURE CLASSIFICATION & EQUILIBRIUM")
-
     if not is_indeterminate:
         sup1, sup2 = supports[0], supports[1]
         L_sup = sup2.x - sup1.x 
         
-        steps.append(f"System: Statically Determinate Beam (Supports at x={sup1.x}m and x={sup2.x}m)")
-        steps.append(f"Take moment about Support 1: ΣM_1 = 0")
-        
+        steps.append("=== ENGINEERING STATICS : BEAM REACTIONS ===")
         moment_sum_val = 0.0
         total_load = 0.0
         
@@ -90,6 +85,14 @@ def analyze_beam(data: BeamInput):
                 
         R2 = moment_sum_val / L_sup if L_sup > 0 else 0.0
         R1 = total_load - R2
+        
+        steps.append(f"[Step 1] ΣM_({sup1.x}) = 0")
+        steps.append(f"➔ R_({sup2.x}) * ({L_sup:.2f}) - ({moment_sum_val:.2f}) = 0")
+        steps.append(f"➔ R_({sup2.x}) = {R2:.2f} {unit}")
+        
+        steps.append(f"\n[Step 2] ΣFy = 0")
+        steps.append(f"➔ R_({sup1.x}) + R_({sup2.x}) - ({total_load:.2f}) = 0")
+        steps.append(f"➔ R_({sup1.x}) = {R1:.2f} {unit}")
         
         reactions = [
             {"support_x": sup1.x, "force_kN": R1},
@@ -118,8 +121,9 @@ def analyze_beam(data: BeamInput):
                 moment_smooth += m_val * mac_step(x_smooth, l.x, 0)
 
     else:
-        steps.append(f"System: Statically Indeterminate Continuous Beam ({len(supports)} supports)")
-        steps.append("Method: Moment Distribution (Hardy Cross Algorithm)")
+        steps.append("=== MOMENT DISTRIBUTION METHOD ===")
+        steps.append(f"Continuous Beam ({len(supports)} supports)")
+        steps.append("Executing iterations until unbalanced moment -> 0...")
         
         num_spans = len(supports) - 1
         spans = []
@@ -169,8 +173,6 @@ def analyze_beam(data: BeamInput):
         for n in nodes:
             if n.type == 'fixed':
                 joint_moments[n.id] = 0.0
-
-        steps.append("Executing Moment Distribution iterations until unbalanced moment -> 0...")
         
         running_fem_left = {i: fem[(i, "left")] for i in range(num_spans)}
         running_fem_right = {i: fem[(i, "right")] for i in range(num_spans)}
@@ -212,8 +214,6 @@ def analyze_beam(data: BeamInput):
                 joint_moments[n.id] = running_fem_right.get(num_spans-1, 0.0)
             else:
                 joint_moments[n.id] = running_fem_right.get(j-1, 0.0)
-
-        steps.append("Moment Distribution completed successfully.")
 
         for i, span in enumerate(spans):
             xl = span["x_left"]
@@ -280,11 +280,6 @@ def analyze_beam(data: BeamInput):
         v_val = float(shear_smooth[idx])
         m_val = float(moment_smooth[idx])
         tabular_data.append({"x": float(x_val), "shear": v_val, "moment": m_val})
-
-    steps.append("==================================================")
-    steps.append("3. MAXIMUM DESIGN VALUES")
-    steps.append(f"Maximum Shear Force (V_max) = {max_shear:.2f} {unit}")
-    steps.append(f"Maximum Bending Moment (M_max) = {max_moment:.2f} {moment_unit}")
 
     return {
         "reactions": reactions,
